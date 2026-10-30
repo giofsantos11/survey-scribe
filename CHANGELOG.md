@@ -15,6 +15,10 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the established behaviour, except OCR (see Changed). OCR remains limited to approved
   English model artifacts.
 - `SourceRegistry.supported_suffixes()`.
+- `PdfConversionOptions.engine` (`SURVEY_SCRIBE_PDF_ENGINE`) selects the Docling PDF
+  engine, `pypdfium2` (the default) or `docling-parse`. On a text PDF, `docling-parse`
+  kept all question numbers and answer codes. On a scanned page its OCR text was
+  worse, so `pypdfium2` stays the default.
 
 ### Changed
 

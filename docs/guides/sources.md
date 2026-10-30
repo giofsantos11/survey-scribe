@@ -244,12 +244,14 @@ registry = SourceRegistry.default(
 | `max_heading_level` | `6` | the deepest inferred level |
 | `include_furniture` | `False` | keep page headers and footers; the layout model files a page-top section title as a page header |
 | `table_mode` | `"accurate"` | TableFormer `"accurate"` or `"fast"` |
+| `engine` | `"pypdfium2"` | the Docling PDF engine that reads the pages, `"pypdfium2"` or `"docling-parse"` (Docling's own default engine). On a text layer, `"docling-parse"` can keep dotted question numbers (`A1.5`) and write-in codes that `"pypdfium2"` splits. Check the OCR text of scanned pages before you change the engine. |
 
 The same options are read from the environment by `SourceRegistry.default()`
 when no `pdf_options` are passed: `SURVEY_SCRIBE_PDF_OCR`,
 `SURVEY_SCRIBE_PDF_OCR_LANGUAGES` (comma-separated),
 `SURVEY_SCRIBE_PDF_HEADING_LEVELS`, `SURVEY_SCRIBE_PDF_MAX_HEADING_LEVEL`,
-`SURVEY_SCRIBE_PDF_INCLUDE_FURNITURE`, `SURVEY_SCRIBE_PDF_TABLE_MODE`.
+`SURVEY_SCRIBE_PDF_INCLUDE_FURNITURE`, `SURVEY_SCRIBE_PDF_TABLE_MODE`,
+`SURVEY_SCRIBE_PDF_ENGINE`.
 
 In `auto` mode the adapter checks each page before conversion. A page needs OCR
 when its text layer holds fewer than 32 visible characters, or when one image

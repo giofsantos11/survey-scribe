@@ -1246,7 +1246,7 @@ def _install_docling_result(
     *,
     ocr_pages: tuple[int, ...] = (),
     captured: dict[str, Any] | None = None,
-) -> None:
+) -> dict[str, Any]:
     calls: dict[str, Any] = {} if captured is None else captured
 
     class FakePipelineOptions:
@@ -1261,6 +1261,9 @@ def _install_docling_result(
 
     modules = {
         "docling.backend.pypdfium2_backend": SimpleNamespace(PyPdfiumDocumentBackend=object()),
+        "docling.backend.docling_parse_backend": SimpleNamespace(
+            ThreadedDoclingParseDocumentBackend=object()
+        ),
         "docling.datamodel.base_models": SimpleNamespace(InputFormat=SimpleNamespace(PDF="pdf")),
         "docling.datamodel.pipeline_options": SimpleNamespace(
             EasyOcrOptions=lambda **kwargs: calls.setdefault("ocr_kwargs", kwargs),
@@ -1279,6 +1282,7 @@ def _install_docling_result(
         "validated_ocr_model_snapshot",
         lambda path: nullcontext(path),
     )
+    return modules
 
 
 class EmptyDoclingDocument:
@@ -1457,6 +1461,7 @@ def test_pdf_options_default_to_text_layer_first_reading() -> None:
     assert (options.ocr, options.ocr_languages) == ("auto", ("en",))
     assert (options.heading_levels, options.max_heading_level) == (False, 6)
     assert (options.include_furniture, options.table_mode) == (False, "accurate")
+    assert options.engine == "pypdfium2"
     assert DoclingConverter().options == options
     assert docling_source.PdfConversionOptions.from_environment({}) == options
 
@@ -1470,6 +1475,8 @@ def test_pdf_options_reject_unknown_values() -> None:
         docling_source.PdfConversionOptions(ocr_languages=())
     with pytest.raises(ValueError):
         docling_source.PdfConversionOptions(max_heading_level=7)
+    with pytest.raises(ValueError, match="engine must be one of"):
+        docling_source.PdfConversionOptions(engine="pdfminer")
 
 
 @pytest.mark.parametrize("level", [True, 0, 1.5, "3", None])
@@ -1688,6 +1695,36 @@ def test_pdf_options_report_missing_docling_stages(
 
     with pytest.raises(SourceDependencyError, match=message):
         DoclingConverter(options)(str(tmp_path / "questionnaire.pdf"), str(artifacts))
+
+
+@pytest.mark.parametrize(
+    ("engine", "module", "backend"),
+    [
+        ("pypdfium2", "docling.backend.pypdfium2_backend", "PyPdfiumDocumentBackend"),
+        (
+            "docling-parse",
+            "docling.backend.docling_parse_backend",
+            "ThreadedDoclingParseDocumentBackend",
+        ),
+    ],
+)
+def test_pdf_engine_option_selects_the_docling_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engine: str, module: str, backend: str
+) -> None:
+    captured: dict[str, Any] = {}
+    modules = _install_docling_result(
+        monkeypatch, SimpleNamespace(document=EmptyDoclingDocument(1)), captured=captured
+    )
+    options = docling_source.PdfConversionOptions.from_environment(
+        {"SURVEY_SCRIBE_PDF_ENGINE": engine.upper()}
+    )
+    assert options.engine == engine
+    artifacts = tmp_path / "models"
+    artifacts.mkdir()
+
+    DoclingConverter(options)(str(tmp_path / "questionnaire.pdf"), str(artifacts))
+
+    assert captured["format_kwargs"]["backend"] is getattr(modules[module], backend)
 
 
 def test_default_registry_passes_pdf_options_to_the_adapter(

@@ -132,6 +132,14 @@ class PdfConverter(Protocol):
 
 _OCR_MODES = ("always", "auto", "never")
 _TABLE_MODES = ("accurate", "fast")
+# Each PDF engine maps to the Docling module and class that read the PDF pages.
+_PDF_ENGINES = {
+    "docling-parse": (
+        "docling.backend.docling_parse_backend",
+        "ThreadedDoclingParseDocumentBackend",
+    ),
+    "pypdfium2": ("docling.backend.pypdfium2_backend", "PyPdfiumDocumentBackend"),
+}
 _PDF_ENV_PREFIX = "SURVEY_SCRIBE_PDF_"
 # A scanned page can still carry a short text stamp, such as a page number or a scanner
 # mark. A page of questions holds hundreds of characters. A page with fewer visible
@@ -165,6 +173,8 @@ class PdfConversionOptions:
         include_furniture: keep page headers and footers. The layout model files a section title
             printed at the top of a page as a page header, which the default read drops.
         table_mode: TableFormer ``"accurate"`` (slower) or ``"fast"``.
+        engine: the Docling PDF engine that reads the pages, ``"pypdfium2"`` or
+            ``"docling-parse"`` (Docling's own default engine).
     """
 
     ocr: str = "auto"
@@ -173,12 +183,15 @@ class PdfConversionOptions:
     max_heading_level: int = 6
     include_furniture: bool = False
     table_mode: str = "accurate"
+    engine: str = "pypdfium2"
 
     def __post_init__(self) -> None:
         if self.ocr not in _OCR_MODES:
             raise ValueError(f"ocr must be one of {_OCR_MODES}, not {self.ocr!r}")
         if self.table_mode not in _TABLE_MODES:
             raise ValueError(f"table_mode must be one of {_TABLE_MODES}, not {self.table_mode!r}")
+        if self.engine not in _PDF_ENGINES:
+            raise ValueError(f"engine must be one of {tuple(_PDF_ENGINES)}, not {self.engine!r}")
         if isinstance(self.ocr_languages, str):
             raise ValueError("ocr_languages must be a sequence of language codes, not a string")
         languages = tuple(str(code).strip() for code in self.ocr_languages)
@@ -205,7 +218,7 @@ class PdfConversionOptions:
         (comma-separated), ``SURVEY_SCRIBE_PDF_HEADING_LEVELS`` and
         ``SURVEY_SCRIBE_PDF_INCLUDE_FURNITURE`` (1 | true | yes | on),
         ``SURVEY_SCRIBE_PDF_MAX_HEADING_LEVEL`` (1-6), ``SURVEY_SCRIBE_PDF_TABLE_MODE``
-        (accurate | fast).
+        (accurate | fast), ``SURVEY_SCRIBE_PDF_ENGINE`` (docling-parse | pypdfium2).
         """
         env = os.environ if environ is None else environ
 
@@ -242,6 +255,7 @@ class PdfConversionOptions:
             max_heading_level=max_level,
             include_furniture=flag("INCLUDE_FURNITURE", defaults.include_furniture),
             table_mode=(read("TABLE_MODE") or defaults.table_mode).lower(),
+            engine=(read("ENGINE") or defaults.engine).lower(),
         )
 
 
@@ -296,8 +310,9 @@ class DoclingConverter:
                     f"OCR is required for PDF {_page_list(ocr_pages)} "
                     f"(too little text or an image over half the page). {error}"
                 ) from None
+        engine_module, engine_class = _PDF_ENGINES[options.engine]
         try:
-            backend_module = import_module("docling.backend.pypdfium2_backend")
+            backend_module = import_module(engine_module)
             base_module = import_module("docling.datamodel.base_models")
             pipeline_module = import_module("docling.datamodel.pipeline_options")
             converter_module = import_module("docling.document_converter")
@@ -305,6 +320,9 @@ class DoclingConverter:
             raise SourceDependencyError(
                 "PDF conversion requires the optional 'pdf' dependencies"
             ) from error
+        backend = getattr(backend_module, engine_class, None)
+        if backend is None:
+            raise SourceDependencyError(f"Installed Docling has no {options.engine} PDF engine")
 
         snapshot: AbstractContextManager[Path | None] = (
             validated_ocr_model_snapshot(artifact_root) if do_ocr else nullcontext(None)
@@ -340,7 +358,7 @@ class DoclingConverter:
                 )
             format_option = converter_module.PdfFormatOption(
                 pipeline_options=pipeline_options,
-                backend=backend_module.PyPdfiumDocumentBackend,
+                backend=backend,
             )
             converter = converter_module.DocumentConverter(
                 format_options={base_module.InputFormat.PDF: format_option}
