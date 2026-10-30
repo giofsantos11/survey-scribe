@@ -12,11 +12,18 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   or `SURVEY_SCRIBE_PDF_*` variables): OCR `always | auto | never` (`never` reads the
   text layer alone, any script, no EasyOCR artifacts), inferred heading levels with
   `section_path` ancestors, page furniture, and TableFormer mode. Unset options keep
-  the established behaviour. OCR remains limited to approved English model artifacts.
+  the established behaviour, except OCR (see Changed). OCR remains limited to approved
+  English model artifacts.
 - `SourceRegistry.supported_suffixes()`.
 
 ### Changed
 
+- PDF OCR defaults to `auto`. The adapter runs OCR only on a page with fewer than 32
+  visible characters or one image over half the page. Such a page gets a
+  `PDF_PAGE_OCR` warning, and the error names it if the EasyOCR artifacts are missing.
+  A PDF with no such page needs no EasyOCR artifacts. `ocr="always"` keeps full-page
+  OCR. On a 19-page questionnaire with a text layer, forced OCR kept 88 of 113
+  question numbers and the text layer kept 112.
 - Chunking keeps a table with the text printed above it: a table joins the running
   chunk while the token budget allows (it is still never split) instead of always
   opening a chunk of its own.

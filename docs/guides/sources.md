@@ -172,9 +172,10 @@ Install the PDF extra:
 python -m pip install "survey-scribe[pdf]"
 ```
 
-PDF conversion requires a configured local Docling/EasyOCR artifact directory.
-Configure and validate it before constructing the default registry. The PDF
-adapter reads `DOCLING_ARTIFACTS_PATH`; the standalone validator also accepts
+PDF conversion requires a configured local Docling artifact directory. When OCR
+runs, the directory also needs the approved EasyOCR archives. Configure and
+validate it before constructing the default registry. The PDF adapter reads
+`DOCLING_ARTIFACTS_PATH`; the standalone validator also accepts
 `SURVEY_SCRIBE_OCR_CACHE`:
 
 === "Linux and macOS"
@@ -202,9 +203,10 @@ if invalid:
     raise RuntimeError("OCR cache validation failed")
 ```
 
-The PDF adapter validates the approved archives and the exact extracted model
-files before conversion. It rejects a missing, unsafe, or changed cache and
-configures EasyOCR for English-only offline use with downloads disabled.
+When OCR runs, the PDF adapter validates the approved archives and the exact
+extracted model files before conversion. It rejects a missing, unsafe, or
+changed cache and configures EasyOCR for English-only offline use with downloads
+disabled.
 
 The PDF worker sets offline flags and blocks common Python socket calls during
 conversion. This is application-level protection, not an operating-system
@@ -216,10 +218,10 @@ new document, language, scan condition, or layout.
 
 ### PDF conversion options
 
-The defaults above are Survey Scribe's established behaviour: full-page OCR of
-every page, flat section headings, body text only. `PdfConversionOptions`
-loosens one choice at a time for a caller that knows its documents; an unset
-option keeps the default.
+By default the adapter reads the text layer of each page and runs OCR only on a
+page that needs it. Section headings stay flat and the adapter keeps body text
+only. `PdfConversionOptions` changes one choice at a time for a caller that
+knows its documents. An unset option keeps the default.
 
 ```python
 from survey_scribe.sources.docling import PdfConversionOptions
@@ -236,7 +238,7 @@ registry = SourceRegistry.default(
 
 | option | default | meaning |
 |---|---|---|
-| `ocr` | `"always"` | `"always"` OCRs every page; `"auto"` keeps the text layer and OCRs only pages without one; `"never"` reads the text layer alone (born-digital PDFs in any script, no EasyOCR artifacts required) |
+| `ocr` | `"auto"` | `"auto"` reads the text layer and runs OCR only on a page that needs it (see below); `"always"` OCRs every page and ignores the text layer; `"never"` reads the text layer alone (born-digital PDFs in any script, no EasyOCR artifacts required) |
 | `ocr_languages` | `("en",)` | OCR currently supports English only; other recognition languages need approved language-specific model artifacts and are rejected when OCR is enabled. `ocr="never"` can read a text layer in any script. |
 | `heading_levels` | `False` | infer heading depth from bookmarks, numbering and font style (Docling's heading-hierarchy stage); `section_path` then lists the ancestors |
 | `max_heading_level` | `6` | the deepest inferred level |
@@ -249,9 +251,21 @@ when no `pdf_options` are passed: `SURVEY_SCRIBE_PDF_OCR`,
 `SURVEY_SCRIBE_PDF_HEADING_LEVELS`, `SURVEY_SCRIBE_PDF_MAX_HEADING_LEVEL`,
 `SURVEY_SCRIBE_PDF_INCLUDE_FURNITURE`, `SURVEY_SCRIBE_PDF_TABLE_MODE`.
 
-With `ocr="never"` the artifacts directory holds Docling's layout and table
-models only (`docling-tools models download layout tableformer -o <dir>`); with
-OCR enabled it also holds the approved EasyOCR archives described above.
+In `auto` mode the adapter checks each page before conversion. A page needs OCR
+when its text layer holds fewer than 32 visible characters, or when one image
+covers half of the page or more. A scanned page with a text stamp, such as a page
+number, still needs OCR. The check skips a page that cannot load, and Docling
+reports that page with `PDF_PAGE_CONVERSION_FAILED`.
+
+If no page needs OCR, no OCR runs. Otherwise Docling runs OCR on the image areas
+and keeps the text layer where there is one. Each page that needs OCR gets a
+`PDF_PAGE_OCR` warning in `SourceDocument.diagnostics`.
+
+The artifacts directory always holds Docling's layout and table models
+(`docling-tools models download layout tableformer -o <dir>`). When OCR runs,
+the directory also needs the approved EasyOCR archives described above. OCR runs
+with `ocr="always"`, and with `ocr="auto"` when a page needs it. If the archives
+are missing for such a page, the error names the page.
 
 ## XLSX safety
 

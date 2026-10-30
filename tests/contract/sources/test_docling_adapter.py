@@ -165,6 +165,50 @@ def _write_pdf(path: Path, page_count: int = 1) -> None:
         document.close()
 
 
+def _write_text_pdf(
+    path: Path,
+    page_texts: tuple[str | None, ...],
+    images: dict[int, tuple[int, int]] | None = None,
+) -> None:
+    """A PDF with one line of Helvetica text on each page, so each page has a text layer.
+    A ``None`` page points to an object that is not in the file, so the page cannot load.
+    ``images`` maps a page number to the width and height of one gray image on that page."""
+    objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray "
+        "/BitsPerComponent 8 /Length 1 >>\nstream\n\x80\nendstream",
+    ]
+    kids = []
+    for number, text in enumerate(page_texts, start=1):
+        if text is None:
+            kids.append("99 0 R")
+            continue
+        stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET"
+        if images and number in images:
+            width, height = images[number]
+            stream = f"q {width} 0 0 {height} 0 0 cm /Im1 Do Q {stream}"
+        objects.append(f"<< /Length {len(stream)} >>\nstream\n{stream}\nendstream")
+        objects.append(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources "
+            f"<< /Font << /F1 3 0 R >> /XObject << /Im1 4 0 R >> >> /Contents {len(objects)} 0 R >>"
+        )
+        kids.append(f"{len(objects)} 0 R")
+    objects[1] = f"<< /Type /Pages /Kids [{' '.join(kids)}] /Count {len(kids)} >>"
+    data = b"%PDF-1.4\n"
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(data))
+        data += f"{number} 0 obj\n{body}\nendobj\n".encode("latin-1")
+    xref = len(data)
+    data += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    data += "".join(f"{offset:010d} 00000 n \n" for offset in offsets).encode()
+    data += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n".encode()
+    data += f"startxref\n{xref}\n%%EOF\n".encode()
+    path.write_bytes(data)
+
+
 def test_pdf_fake_preserves_preamble_scanned_content_and_page_provenance(tmp_path: Path) -> None:
     path = tmp_path / "questionnaire.pdf"
     _write_pdf(path)
@@ -397,6 +441,8 @@ def test_docling_configuration_uses_local_pdfium_and_disables_remote_services(
         "validated_ocr_model_snapshot",
         lambda _path: nullcontext(model_root),
     )
+    # the page check flags page 2, so "auto" runs OCR
+    monkeypatch.setattr(docling_source, "_pages_that_need_ocr", lambda _path: (2,))
     if ocr == "never":
 
         def unexpected_ocr_cache(_path: Path) -> object:
@@ -532,6 +578,7 @@ def test_docling_converter_normalizes_tables_and_skips_empty_items(
         ),
     }
     monkeypatch.setattr(docling_source, "import_module", modules.__getitem__)
+    monkeypatch.setattr(docling_source, "_pages_that_need_ocr", lambda _path: ())
     artifacts = tmp_path / "ocr"
     artifacts.mkdir()
     monkeypatch.setattr(docling_source, "resolve_ocr_cache", lambda path: path.resolve())
@@ -1196,7 +1243,12 @@ def test_pdf_conversion_block_synchronizes_page_and_pages() -> None:
 def _install_docling_result(
     monkeypatch: pytest.MonkeyPatch,
     result: object,
+    *,
+    ocr_pages: tuple[int, ...] = (),
+    captured: dict[str, Any] | None = None,
 ) -> None:
+    calls: dict[str, Any] = {} if captured is None else captured
+
     class FakePipelineOptions:
         pass
 
@@ -1211,15 +1263,16 @@ def _install_docling_result(
         "docling.backend.pypdfium2_backend": SimpleNamespace(PyPdfiumDocumentBackend=object()),
         "docling.datamodel.base_models": SimpleNamespace(InputFormat=SimpleNamespace(PDF="pdf")),
         "docling.datamodel.pipeline_options": SimpleNamespace(
-            EasyOcrOptions=lambda **_kwargs: object(),
+            EasyOcrOptions=lambda **kwargs: calls.setdefault("ocr_kwargs", kwargs),
             PdfPipelineOptions=FakePipelineOptions,
         ),
         "docling.document_converter": SimpleNamespace(
             DocumentConverter=FakeDocumentConverter,
-            PdfFormatOption=lambda **_kwargs: object(),
+            PdfFormatOption=lambda **kwargs: calls.setdefault("format_kwargs", kwargs),
         ),
     }
     monkeypatch.setattr(docling_source, "import_module", modules.__getitem__)
+    monkeypatch.setattr(docling_source, "_pages_that_need_ocr", lambda _path: ocr_pages)
     monkeypatch.setattr(docling_source, "resolve_ocr_cache", lambda path: path.resolve())
     monkeypatch.setattr(
         docling_source,
@@ -1397,11 +1450,11 @@ def test_pdf_adapter_uses_document_coverage_when_no_pages_are_detected(
     assert document.coverage == SourceCoverage()
 
 
-def test_pdf_options_default_to_the_established_behaviour() -> None:
-    """Full-page English OCR, flat headings, body text only, accurate tables: a caller that passes
-    nothing gets exactly what the adapter did before the options existed."""
+def test_pdf_options_default_to_text_layer_first_reading() -> None:
+    """The defaults run English OCR only on a page that needs it, with flat headings, body text
+    only and accurate tables. The environment with no variables set gives the same options."""
     options = docling_source.PdfConversionOptions()
-    assert (options.ocr, options.ocr_languages) == ("always", ("en",))
+    assert (options.ocr, options.ocr_languages) == ("auto", ("en",))
     assert (options.heading_levels, options.max_heading_level) == (False, 6)
     assert (options.include_furniture, options.table_mode) == (False, "accurate")
     assert DoclingConverter().options == options
@@ -1484,6 +1537,83 @@ def test_text_layer_only_reading_needs_no_ocr_cache_but_an_artifacts_directory(
     monkeypatch.setattr(docling_source, "import_module", missing_module)
     with pytest.raises(SourceDependencyError, match="optional 'pdf' dependencies"):
         converter(str(tmp_path / "doc.pdf"), str(tmp_path / "models"))
+
+
+@pytest.mark.parametrize("ocr_pages", [(), (2,)])
+def test_auto_ocr_runs_only_when_a_page_needs_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ocr_pages: tuple[int, ...]
+) -> None:
+    """With no page that needs OCR, the converter runs no OCR and leaves the OCR cache alone.
+    A page that needs OCR turns OCR on, not forced, and gets a warning."""
+    captured: dict[str, Any] = {}
+    result = SimpleNamespace(document=EmptyDoclingDocument(2))
+    _install_docling_result(monkeypatch, result, ocr_pages=ocr_pages, captured=captured)
+    if not ocr_pages:
+
+        def unexpected_ocr_cache(_path: Path) -> object:
+            pytest.fail("a PDF with no page that needs OCR must not need the OCR cache")
+
+        monkeypatch.setattr(docling_source, "resolve_ocr_cache", unexpected_ocr_cache)
+        monkeypatch.setattr(docling_source, "validated_ocr_model_snapshot", unexpected_ocr_cache)
+    artifacts = tmp_path / "models"
+    artifacts.mkdir()
+
+    conversion = DoclingConverter()(str(tmp_path / "questionnaire.pdf"), str(artifacts))
+
+    assert captured["format_kwargs"]["pipeline_options"].do_ocr is bool(ocr_pages)
+    if ocr_pages:
+        assert captured["ocr_kwargs"]["force_full_page_ocr"] is False
+    else:
+        assert "ocr_kwargs" not in captured
+    assert [(item.code, item.severity, item.unit_index) for item in conversion.diagnostics] == [
+        ("PDF_PAGE_OCR", "warning", page) for page in ocr_pages
+    ]
+
+
+def test_pages_without_a_text_layer_are_named_when_ocr_artifacts_are_missing(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "questionnaire.pdf"
+    _write_text_pdf(
+        path,
+        (
+            "B1. How old were you on your last birthday? 1. Under 15 2. 15 or older",
+            "7",
+            "B2. Did you do any work for pay in the last 7 days? 1. Yes 2. No",
+        ),
+    )
+    assert docling_source._pages_that_need_ocr(str(path)) == (2,)
+    artifacts = tmp_path / "models"
+    artifacts.mkdir()
+
+    with pytest.raises(SourceDependencyError, match=r"OCR is required for PDF page 2 \("):
+        DoclingConverter()(str(path), str(artifacts))
+
+
+def test_page_check_leaves_a_page_that_cannot_load_to_docling(tmp_path: Path) -> None:
+    """Docling reports a page that cannot load as a failed page, so the check must not stop."""
+    path = tmp_path / "questionnaire.pdf"
+    _write_text_pdf(
+        path,
+        ("B1. How old were you on your last birthday? 1. Under 15 2. 15 or older", None, "7"),
+    )
+
+    assert docling_source._pages_that_need_ocr(str(path)) == (3,)
+
+
+def test_page_check_flags_a_scanned_page_that_carries_a_text_stamp(tmp_path: Path) -> None:
+    """A logo keeps a page of questions machine readable. A scan with a text stamp needs OCR."""
+    path = tmp_path / "questionnaire.pdf"
+    _write_text_pdf(
+        path,
+        (
+            "B1. How old were you on your last birthday? 1. Under 15 2. 15 or older",
+            "Labour Force Survey 2024, scanned copy, page 6 of 19",
+        ),
+        images={1: (60, 40), 2: (612, 792)},
+    )
+
+    assert docling_source._pages_that_need_ocr(str(path)) == (2,)
 
 
 def test_headings_keep_their_ancestors_by_level() -> None:

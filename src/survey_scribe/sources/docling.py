@@ -133,20 +133,30 @@ class PdfConverter(Protocol):
 _OCR_MODES = ("always", "auto", "never")
 _TABLE_MODES = ("accurate", "fast")
 _PDF_ENV_PREFIX = "SURVEY_SCRIBE_PDF_"
+# A scanned page can still carry a short text stamp, such as a page number or a scanner
+# mark. A page of questions holds hundreds of characters. A page with fewer visible
+# characters than this limit has no usable text layer and gets OCR in the "auto" mode.
+_MIN_TEXT_LAYER_CHARS = 32
+# A stamp can also be longer than that limit. A scanned page is one image over the whole
+# page, but a logo or a figure on a page of questions is much smaller. A page where one
+# image covers this share of the page or more also gets OCR in the "auto" mode.
+_MIN_SCAN_IMAGE_SHARE = 0.5
 
 
 @dataclass(frozen=True, slots=True)
 class PdfConversionOptions:
     """How the local Docling pipeline reads a PDF.
 
-    The defaults are Survey Scribe's established behaviour: full-page English OCR of every page,
-    flat section headings, body text only. Each field loosens one of those choices for a caller
-    that knows its documents; nothing changes for one that does not.
+    The defaults read the text layer of each page and run English OCR only on a page that needs
+    it. Section headings stay flat and the read keeps body text only. Each field changes one of
+    those choices for a caller that knows its documents.
 
     Attributes:
-        ocr: ``"always"`` runs OCR over every page (the text layer is ignored); ``"auto"`` keeps
-            the text layer and runs OCR only where a page has none; ``"never"`` reads the text
-            layer alone, needs no OCR artifacts, and keeps any script the PDF carries verbatim.
+        ocr: ``"auto"`` reads the text layer and runs OCR only on a page with too little text or
+            with one image over half of the page; a PDF with no such page needs no OCR artifacts.
+            ``"always"`` runs OCR over every page (the text layer is ignored); ``"never"`` reads
+            the text layer alone, needs no OCR artifacts, and keeps any script the PDF carries
+            verbatim.
         ocr_languages: EasyOCR language codes. OCR currently supports only English because the
             approved model snapshot contains only the English recognition model.
         heading_levels: infer heading depth (bookmarks, numbering, font style) instead of
@@ -157,7 +167,7 @@ class PdfConversionOptions:
         table_mode: TableFormer ``"accurate"`` (slower) or ``"fast"``.
     """
 
-    ocr: str = "always"
+    ocr: str = "auto"
     ocr_languages: tuple[str, ...] = ("en",)
     heading_levels: bool = False
     max_heading_level: int = 6
@@ -250,7 +260,7 @@ def _push_heading(
 
 
 class DoclingConverter:
-    """Lazy Docling converter configured for local PDFium and, by default, full-page OCR."""
+    """Lazy local Docling converter that, by default, runs OCR only on pages that need it."""
 
     def __init__(self, options: PdfConversionOptions | None = None) -> None:
         self.options = options or PdfConversionOptions()
@@ -261,21 +271,31 @@ class DoclingConverter:
             raise SourceDependencyError(
                 "PDF OCR artifacts are not configured; set DOCLING_ARTIFACTS_PATH"
             )
-        if options.ocr == "never":
-            # the layout and table models only: no OCR archive to validate
+        ocr_pages: tuple[int, ...] = ()
+        artifact_root = Path(artifacts_path)
+        if options.ocr != "always":
+            # Docling reads its layout and table models from this directory.
             try:
-                artifact_root = Path(artifacts_path).resolve(strict=True)
+                artifact_root = artifact_root.resolve(strict=True)
             except OSError:
                 raise SourceDependencyError(
                     "Configured Docling artifacts directory does not exist"
                 ) from None
             if not artifact_root.is_dir():
                 raise SourceDependencyError("Configured Docling artifacts path is not a directory")
-        else:
+            if options.ocr == "auto":
+                ocr_pages = _pages_that_need_ocr(path)
+        do_ocr = options.ocr == "always" or bool(ocr_pages)
+        if do_ocr:
             try:
                 artifact_root = resolve_ocr_cache(Path(artifacts_path))
             except OcrCacheError as error:
-                raise SourceDependencyError(str(error)) from None
+                if not ocr_pages:
+                    raise SourceDependencyError(str(error)) from None
+                raise SourceDependencyError(
+                    f"OCR is required for PDF {_page_list(ocr_pages)} "
+                    f"(too little text or an image over half the page). {error}"
+                ) from None
         try:
             backend_module = import_module("docling.backend.pypdfium2_backend")
             base_module = import_module("docling.datamodel.base_models")
@@ -287,13 +307,11 @@ class DoclingConverter:
             ) from error
 
         snapshot: AbstractContextManager[Path | None] = (
-            validated_ocr_model_snapshot(artifact_root)
-            if options.ocr != "never"
-            else nullcontext(None)
+            validated_ocr_model_snapshot(artifact_root) if do_ocr else nullcontext(None)
         )
         with snapshot as model_root:
             pipeline_options = pipeline_module.PdfPipelineOptions()
-            pipeline_options.do_ocr = options.ocr != "never"
+            pipeline_options.do_ocr = do_ocr
             pipeline_options.do_table_structure = True
             pipeline_options.enable_remote_services = False
             pipeline_options.artifacts_path = artifact_root
@@ -401,6 +419,16 @@ class DoclingConverter:
                 failed_units=failed_pages,
             )
             diagnostics = tuple(
+                SourceDiagnostic(
+                    code="PDF_PAGE_OCR",
+                    message="PDF page has too little text or an image over half the page, "
+                    "so OCR reads it",
+                    severity="warning",
+                    unit="page",
+                    unit_index=page,
+                )
+                for page in ocr_pages
+            ) + tuple(
                 SourceDiagnostic(
                     code="PDF_PAGE_CONVERSION_FAILED",
                     message="PDF page conversion failed",
@@ -867,6 +895,56 @@ def _bounded_process_cleanup(process: Any) -> None:
     process.join(timeout=0.5)
     if process.is_alive():
         raise SourceConversionError("PDF worker cleanup did not complete")
+
+
+def _pages_that_need_ocr(path: str) -> tuple[int, ...]:
+    """The pages with fewer than ``_MIN_TEXT_LAYER_CHARS`` visible characters, or with one image
+    that covers ``_MIN_SCAN_IMAGE_SHARE`` of the page or more."""
+    try:
+        pdfium = import_module("pypdfium2")
+        image_type = import_module("pypdfium2.raw").FPDF_PAGEOBJ_IMAGE
+    except ModuleNotFoundError as error:
+        raise SourceDependencyError(
+            "PDF conversion requires the optional 'pdf' dependencies"
+        ) from error
+    pages: list[int] = []
+    document = pdfium.PdfDocument(path)
+    try:
+        for index in range(len(document)):
+            try:
+                page = document[index]
+            except pdfium.PdfiumError:
+                # Docling reports a page that cannot load as a failed page.
+                continue
+            textpage = page.get_textpage()
+            try:
+                text = textpage.get_text_bounded()
+                visible = sum(1 for char in text if char.isprintable() and not char.isspace())
+                if (
+                    visible < _MIN_TEXT_LAYER_CHARS
+                    or _largest_image_share(page, image_type) >= _MIN_SCAN_IMAGE_SHARE
+                ):
+                    pages.append(index + 1)
+            finally:
+                textpage.close()
+                page.close()
+    finally:
+        document.close()
+    return tuple(pages)
+
+
+def _largest_image_share(page: Any, image_type: int) -> float:
+    width, height = page.get_size()
+    largest = 0.0
+    for image in page.get_objects(filter=[image_type], max_depth=3):
+        left, bottom, right, top = image.get_pos()
+        largest = max(largest, (right - left) * (top - bottom) / (width * height))
+    return largest
+
+
+def _page_list(pages: tuple[int, ...]) -> str:
+    numbers = ", ".join(str(page) for page in pages)
+    return f"page {numbers}" if len(pages) == 1 else f"pages {numbers}"
 
 
 def _pdf_preflight_worker(path: str, max_pages: int, output: Any) -> None:
